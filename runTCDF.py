@@ -9,8 +9,115 @@ import copy
 import matplotlib.pyplot as plt
 import os
 import sys
+import json
+import hashlib
+from joblib import Parallel, delayed
+import multiprocessing
 
 # os.chdir(os.path.dirname(sys.argv[0])) #uncomment this line to run in VSCode
+
+
+def get_cache_dir():
+  """获取缓存目录，如果不存在则创建"""
+  cache_dir = 'cache'
+  if not os.path.exists(cache_dir):
+    os.makedirs(cache_dir)
+  return cache_dir
+
+
+def get_dataset_cache_key(datafile, args):
+  """生成数据集的缓存键，基于数据文件和关键参数"""
+  # 读取数据文件的前几行来生成哈希
+  df = pd.read_csv(datafile, nrows=1000)
+  data_hash = hashlib.md5(df.to_string().encode()).hexdigest()
+
+  # 组合关键参数
+  key_params = {
+      'data_hash': data_hash,
+      'epochs': args.epochs,
+      'kernel_size': args.kernel_size,
+      'hidden_layers': args.hidden_layers,
+      'learning_rate': args.learning_rate,
+      'optimizer': args.optimizer,
+      'dilation_coefficient': args.dilation_coefficient,
+      'significance': args.significance
+  }
+
+  return hashlib.md5(json.dumps(key_params,
+                                sort_keys=True).encode()).hexdigest()
+
+
+def get_column_cache_key(dataset_key, column_idx, column_name):
+  """生成单个列的缓存键"""
+  key_params = {
+      'dataset_key': dataset_key,
+      'column_idx': column_idx,
+      'column_name': column_name
+  }
+  return hashlib.md5(json.dumps(key_params,
+                                sort_keys=True).encode()).hexdigest()
+
+
+def load_column_cache(dataset_key, column_idx, column_name):
+  """从缓存加载单个列的结果"""
+  cache_dir = get_cache_dir()
+  column_key = get_column_cache_key(dataset_key, column_idx, column_name)
+  cache_file = os.path.join(cache_dir, f'column_{column_key}.json')
+
+  if os.path.exists(cache_file):
+    with open(cache_file, 'r', encoding='utf-8') as f:
+      return json.load(f)
+  return None
+
+
+def save_column_cache(
+    dataset_key, column_idx, column_name, causes, causeswithdelay, realloss,
+    scores
+):
+  """保存单个列的结果到缓存"""
+  cache_dir = get_cache_dir()
+  column_key = get_column_cache_key(dataset_key, column_idx, column_name)
+  cache_file = os.path.join(cache_dir, f'column_{column_key}.json')
+
+  column_result = {
+      'causes': causes,
+      'causeswithdelay': {
+          str(k): v
+          for k, v in causeswithdelay.items()
+      },  # 将元组键转换为字符串
+      'realloss': realloss,
+      'scores': scores
+  }
+
+  with open(cache_file, 'w', encoding='utf-8') as f:
+    json.dump(column_result, f, ensure_ascii=False, indent=2)
+
+  # 更新列缓存索引
+  index_file = os.path.join(cache_dir, f'index_{dataset_key}.json')
+  if os.path.exists(index_file):
+    with open(index_file, 'r', encoding='utf-8') as f:
+      index = json.load(f)
+  else:
+    index = {'columns': {}}
+
+  index['columns'][str(column_idx)] = {
+      'name': column_name,
+      'cache_key': column_key
+  }
+
+  with open(index_file, 'w', encoding='utf-8') as f:
+    json.dump(index, f, ensure_ascii=False, indent=2)
+
+
+def load_dataset_cache(dataset_key):
+  """加载整个数据集的缓存索引"""
+  cache_dir = get_cache_dir()
+  index_file = os.path.join(cache_dir, f'index_{dataset_key}.json')
+
+  if os.path.exists(index_file):
+    with open(index_file, 'r', encoding='utf-8') as f:
+      return json.load(f)
+  return None
 
 
 def check_positive(value):
@@ -195,33 +302,181 @@ def evaluatedelay(extendedgtdelays, alldelays, TPs, receptivefield):
     return zeros / float(total)
 
 
-def runTCDF(datafile):
-  """Loops through all variables in a dataset and return the discovered causes, time delays, losses, attention scores and variable names."""
+# 为归一化处理添加并行函数
+def zscore_normalize_column(df, column):
+  """并行处理Z-score归一化单列"""
+  series = df[column]
+  mean = series.mean()
+  std = series.std()
+
+  if std == 0 or pd.isna(std):  # 处理常数列
+    normalized = pd.Series(0, index=series.index)
+    warning = f"警告: 列 '{column}' 是常数列或包含NaN值，将其替换为0"
+  else:
+    normalized = (series - mean) / std
+    warning = None
+
+  return column, normalized, warning
+
+
+def minmax_normalize_column(df, column):
+  """并行处理最小-最大归一化单列"""
+  series = df[column]
+  min_val = series.min()
+  max_val = series.max()
+
+  if max_val == min_val:  # 处理常数列
+    normalized = pd.Series(0.5, index=series.index)
+    warning = f"警告: 列 '{column}' 是常数列，将其设置为0.5"
+  else:
+    normalized = (series - min_val) / (max_val - min_val)
+    warning = None
+
+  return column, normalized, warning
+
+
+def normalize_dataframe(df, method='zscore', n_jobs=-1):
+  """并行归一化整个数据框
+  
+  Args:
+      df: 要归一化的pandas DataFrame
+      method: 'zscore'或'minmax'
+      n_jobs: 并行进程数，-1表示使用所有可用核心
+  
+  Returns:
+      normalized_df: 归一化后的DataFrame
+  """
+  columns = df.columns
+
+  # 限制并行进程数不超过列数和可用核心数
+  n_cores = multiprocessing.cpu_count()
+  actual_jobs = min(n_jobs if n_jobs > 0 else n_cores, len(columns), n_cores)
+
+  print(f"应用{method}归一化，并行处理 ({actual_jobs} 进程)...")
+
+  if method == 'zscore':
+    normalize_func = zscore_normalize_column
+  else:  # minmax
+    normalize_func = minmax_normalize_column
+
+  # 并行处理所有列
+  results = Parallel(n_jobs=actual_jobs)(
+      delayed(normalize_func)(df, col) for col in columns
+  )
+
+  # 使用pd.concat一次性构建DataFrame，而非逐列添加，避免碎片化
+  col_series_dict = {}
+  warnings_list = []
+
+  for col, normalized_series, warning in results:
+    col_series_dict[col] = normalized_series
+    if warning:
+      warnings_list.append(warning)
+
+  # 一次性创建DataFrame
+  normalized_df = pd.DataFrame(col_series_dict, index=df.index)
+
+  # 打印警告
+  for warning in warnings_list:
+    print(f"  {warning}")
+
+  return normalized_df
+
+
+def runTCDF(datafile, use_cache=False, normalization='zscore', n_jobs=-1):
+  """Loops through all variables in a dataset and return the discovered causes, time delays, losses, attention scores and variable names.
+  
+  Args:
+      datafile: 数据文件路径
+      use_cache: 是否使用缓存
+      normalization: 归一化方法，可选值为'zscore'(标准化)、'minmax'(最小-最大归一化)或None(不进行归一化)
+      n_jobs: 并行处理的进程数，-1表示使用所有可用CPU核心
+  """
   df_data = pd.read_csv(datafile)
+
+  # 数据归一化，使用并行处理
+  if normalization:
+    df_data = normalize_dataframe(df_data, method=normalization, n_jobs=n_jobs)
+    # 复制DataFrame以消除碎片
+    df_data = df_data.copy()
+
+  columns = list(df_data)
 
   allcauses = dict()
   alldelays = dict()
   allreallosses = dict()
   allscores = dict()
 
-  columns = list(df_data)
+  # 为数据集生成缓存键
+  dataset_cache_key = get_dataset_cache_key(datafile, args)
+  if use_cache:
+    # 在缓存键中也考虑归一化方法
+    if normalization:
+      dataset_cache_key += f"_norm_{normalization}"
+
+    # 检查是否有已缓存的列
+    dataset_cache = load_dataset_cache(dataset_cache_key)
+    if dataset_cache and 'columns' in dataset_cache:
+      print(f"找到数据集缓存: {datafile}")
+
+  # 逐列处理
   for c in columns:
     idx = df_data.columns.get_loc(c)
-    causes, causeswithdelay, realloss, scores = TCDF.findcauses(
-        c,
-        cuda=cuda,
-        epochs=nrepochs,
-        kernel_size=kernel_size,
-        layers=levels,
-        log_interval=loginterval,
-        lr=learningrate,
-        optimizername=optimizername,
-        seed=seed,
-        dilation_c=dilation_c,
-        significance=significance,
-        file=datafile
-    )
+    print(f"处理列 {idx+1}/{len(columns)}: {c}")
 
+    # 检查该列是否有缓存
+    column_data = None
+    if use_cache and dataset_cache_key:
+      column_data = load_column_cache(dataset_cache_key, idx, c)
+
+    if column_data:
+      print(f"  使用缓存的结果")
+      causes = column_data['causes']
+      # 将字符串键转回元组
+      causeswithdelay = {}
+      for k, v in column_data['causeswithdelay'].items():
+        # 解析字符串形式的元组 "(a, b)" -> (a, b)
+        key = eval(k)
+        causeswithdelay[key] = v
+      realloss = column_data['realloss']
+      scores = column_data['scores']
+    else:
+      print(f"  计算因果关系...")
+      # 创建临时CSV文件用于TCDF处理，包含归一化数据
+      if normalization:
+        temp_file = f"temp_{dataset_cache_key}_{idx}.csv"
+        df_data.to_csv(temp_file, index=False)
+        temp_datafile = temp_file
+      else:
+        temp_datafile = datafile
+
+      causes, causeswithdelay, realloss, scores = TCDF.findcauses(
+          c,
+          cuda=cuda,
+          epochs=nrepochs,
+          kernel_size=kernel_size,
+          layers=levels,
+          log_interval=loginterval,
+          lr=learningrate,
+          optimizername=optimizername,
+          seed=seed,
+          dilation_c=dilation_c,
+          significance=significance,
+          file=temp_datafile
+      )
+
+      # 删除临时文件
+      if normalization and os.path.exists(temp_file):
+        os.remove(temp_file)
+
+      # 立即保存该列的缓存
+      if dataset_cache_key:
+        save_column_cache(
+            dataset_cache_key, idx, c, causes, causeswithdelay, realloss, scores
+        )
+        print(f"  已保存列缓存")
+
+    # 汇总结果
     allscores[idx] = scores
     allcauses[idx] = causes
     alldelays.update(causeswithdelay)
@@ -280,10 +535,13 @@ def main(datafiles, evaluation):
 
     print("\n Dataset: ", stringdatafile)
 
-    # run TCDF
+    # run TCDF with cache option and normalization
     allcauses, alldelays, allreallosses, allscores, columns = runTCDF(
-        datafile
-    )  #results of TCDF containing indices of causes and effects
+        datafile,
+        use_cache=args.use_cache,
+        normalization=args.normalization,
+        n_jobs=args.n_jobs
+    )
 
     print(
         "\n===================Results for", stringdatafile,
@@ -415,6 +673,26 @@ parser.add_argument(
     default=False,
     help='Show causal graph (default: False)'
 )
+parser.add_argument(
+    '--use_cache',
+    action="store_true",
+    default=False,
+    help='Use cached results if available (default: False)'
+)
+parser.add_argument(
+    '--normalization',
+    type=str,
+    choices=['zscore', 'minmax', 'none'],
+    default='zscore',
+    help='Data normalization method: "zscore" (default), "minmax", or "none"'
+)
+parser.add_argument(
+    '--n_jobs',
+    type=int,
+    default=-1,
+    help=
+    'Number of parallel jobs for normalization. -1 means using all available cores (default: -1)'
+)
 group = parser.add_mutually_exclusive_group(required=True)
 group.add_argument(
     '--ground_truth',
@@ -453,6 +731,9 @@ loginterval = args.log_interval
 seed = args.seed
 cuda = args.cuda
 significance = args.significance
+
+if args.normalization.lower() == 'none':
+  args.normalization = None
 
 if args.ground_truth is not None:
   datafiles = args.ground_truth
